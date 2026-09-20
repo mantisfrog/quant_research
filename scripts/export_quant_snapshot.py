@@ -213,6 +213,23 @@ def quantize8(value: Decimal) -> Decimal:
     return value.quantize(ADJ_SCALE, rounding=ROUND_HALF_UP)
 
 
+def is_na(value) -> bool:
+    return value is None or (isinstance(value, float) and np.isnan(value))
+
+
+def to_decimal(value, scale: int | None = None) -> Decimal | None:
+    if is_na(value):
+        return None
+    result = Decimal(value)
+    if scale is not None:
+        result = result.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP)
+    return result
+
+
+def to_int(value) -> int | None:
+    return None if is_na(value) else int(value)
+
+
 class YearlyWriter:
     """Streams batches into one part-00000.parquet per partition year."""
 
@@ -259,7 +276,7 @@ def scan_daily_bounds(daily_csv: Path, start_id: int) -> tuple[int | None, int]:
 
 
 def load_adjustment_periods(data_dir: Path) -> dict[str, tuple[np.ndarray, np.ndarray, list[str]]]:
-    adj = pd.read_csv(data_dir / "fact_adjustment_factor_period.csv")
+    adj = pd.read_csv(data_dir / "fact_adjustment_factor_period.csv", dtype={"adjust_factor": str})
     adj = adj.sort_values(["stock_code", "valid_from_date_id"])
     periods: dict[str, tuple[np.ndarray, np.ndarray, list[str]]] = {}
     for stock_code, group in adj.groupby("stock_code", sort=False):
@@ -293,66 +310,82 @@ def export_market(
     writer = YearlyWriter(temp_root, "market/year={year}/part-00000.parquet", MARKET_SCHEMA)
     dropped = 0
     decimal_dtypes = {
-        name: str for name in
-        ("open", "high", "low", "close", "amount", "market_cap", "float_market_cap")
+        name: str for name in (
+            "open", "high", "low", "close", "vol", "amount",
+            "total_shares", "float_shares", "market_cap", "float_market_cap",
+        )
     }
     reader = pd.read_csv(data_dir / "fact_daily.csv", dtype=decimal_dtypes, chunksize=CHUNK_SIZE)
-    for chunk in reader:
-        chunk = chunk[(chunk["date_id"] >= start_id) & (chunk["date_id"] <= end_id)]
-        if not len(chunk):
-            continue
+    try:
+        for chunk in reader:
+            chunk = chunk[(chunk["date_id"] >= start_id) & (chunk["date_id"] <= end_id)]
+            if not len(chunk):
+                continue
 
-        date_ids = chunk["date_id"].to_numpy()
-        stock_codes = chunk["stock_code"].tolist()
-        keys = list(zip(date_ids.tolist(), stock_codes))
+            date_ids = chunk["date_id"].to_numpy()
+            stock_codes = chunk["stock_code"].tolist()
+            keys = list(zip(date_ids.tolist(), stock_codes))
 
-        factors: list[Decimal | None] = []
-        for date_value, stock_code in keys:
-            period = periods.get(stock_code)
-            factor: Decimal | None = None
-            if period is not None:
-                valid_from, valid_to, factor_texts = period
-                index = int(np.searchsorted(valid_from, date_value, side="right")) - 1
-                if index >= 0 and date_value <= valid_to[index]:
-                    factor = Decimal(factor_texts[index])
-            factors.append(factor)
+            factors: list[Decimal | None] = []
+            for date_value, stock_code in keys:
+                period = periods.get(stock_code)
+                factor: Decimal | None = None
+                if period is not None:
+                    valid_from, valid_to, factor_texts = period
+                    index = int(np.searchsorted(valid_from, date_value, side="right")) - 1
+                    if index >= 0 and date_value <= valid_to[index]:
+                        factor = to_decimal(factor_texts[index], 12)
+                factors.append(factor)
 
-        keep = [i for i, factor in enumerate(factors) if factor is not None]
-        dropped += len(factors) - len(keep)
-        if not keep:
-            continue
+            keep = [i for i, factor in enumerate(factors) if factor is not None]
+            dropped += len(factors) - len(keep)
+            if not keep:
+                continue
 
-        opens = [Decimal(chunk["open"].iat[i]) for i in keep]
-        highs = [Decimal(chunk["high"].iat[i]) for i in keep]
-        lows = [Decimal(chunk["low"].iat[i]) for i in keep]
-        closes = [Decimal(chunk["close"].iat[i]) for i in keep]
-        kept_factors = [factors[i] for i in keep]
-        columns = {
-            "date_id": [int(date_ids[i]) for i in keep],
-            "date": [dates[int(date_ids[i])] for i in keep],
-            "stock_code": [stock_codes[i] for i in keep],
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "adjust_factor": kept_factors,
-            "adj_open": [quantize8(value * factor) for value, factor in zip(opens, kept_factors)],
-            "adj_high": [quantize8(value * factor) for value, factor in zip(highs, kept_factors)],
-            "adj_low": [quantize8(value * factor) for value, factor in zip(lows, kept_factors)],
-            "adj_close": [quantize8(value * factor) for value, factor in zip(closes, kept_factors)],
-            "vol": [int(chunk["vol"].iat[i]) for i in keep],
-            "amount": [Decimal(chunk["amount"].iat[i]) for i in keep],
-            "total_shares": [int(chunk["total_shares"].iat[i]) for i in keep],
-            "float_shares": [int(chunk["float_shares"].iat[i]) for i in keep],
-            "market_cap": [Decimal(chunk["market_cap"].iat[i]) for i in keep],
-            "float_market_cap": [Decimal(chunk["float_market_cap"].iat[i]) for i in keep],
-        }
-        year_values = np.array([value // 10_000 for value in columns["date_id"]])
-        for year, indices in iter_year_slices(year_values):
-            writer.write(
-                year, {name: [values[i] for i in indices] for name, values in columns.items()}
-            )
-    counts = writer.close()
+            opens = [to_decimal(chunk["open"].iat[i], 2) for i in keep]
+            highs = [to_decimal(chunk["high"].iat[i], 2) for i in keep]
+            lows = [to_decimal(chunk["low"].iat[i], 2) for i in keep]
+            closes = [to_decimal(chunk["close"].iat[i], 2) for i in keep]
+            kept_factors = [factors[i] for i in keep]
+            columns = {
+                "date_id": [int(date_ids[i]) for i in keep],
+                "date": [dates[int(date_ids[i])] for i in keep],
+                "stock_code": [stock_codes[i] for i in keep],
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "adjust_factor": kept_factors,
+                "adj_open": [
+                    None if value is None else quantize8(value * factor)
+                    for value, factor in zip(opens, kept_factors)
+                ],
+                "adj_high": [
+                    None if value is None else quantize8(value * factor)
+                    for value, factor in zip(highs, kept_factors)
+                ],
+                "adj_low": [
+                    None if value is None else quantize8(value * factor)
+                    for value, factor in zip(lows, kept_factors)
+                ],
+                "adj_close": [
+                    None if value is None else quantize8(value * factor)
+                    for value, factor in zip(closes, kept_factors)
+                ],
+                "vol": [to_int(chunk["vol"].iat[i]) for i in keep],
+                "amount": [to_decimal(chunk["amount"].iat[i], 4) for i in keep],
+                "total_shares": [to_int(chunk["total_shares"].iat[i]) for i in keep],
+                "float_shares": [to_int(chunk["float_shares"].iat[i]) for i in keep],
+                "market_cap": [to_decimal(chunk["market_cap"].iat[i], 4) for i in keep],
+                "float_market_cap": [to_decimal(chunk["float_market_cap"].iat[i], 4) for i in keep],
+            }
+            year_values = np.array([value // 10_000 for value in columns["date_id"]])
+            for year, indices in iter_year_slices(year_values):
+                writer.write(
+                    year, {name: [values[i] for i in indices] for name, values in columns.items()}
+                )
+    finally:
+        counts = writer.close()
     return counts, dropped
 
 
@@ -386,29 +419,32 @@ def export_financials(
         dtype={"metric_value": str},
         chunksize=CHUNK_SIZE,
     )
-    for chunk in reader:
-        mask = chunk["metric_code"].isin(METRIC_SET) & chunk["report_id"].isin(reports.keys())
-        chunk = chunk[mask]
-        if not len(chunk):
-            continue
-        report_ids = chunk["report_id"].tolist()
-        metric_codes = chunk["metric_code"].tolist()
-        metric_values = chunk["metric_value"].tolist()
-        matched = [reports[report_id] for report_id in report_ids]
-        columns = {
-            "report_id": report_ids,
-            "stock_code": [item[0] for item in matched],
-            "report_period": [item[1] for item in matched],
-            "announce_date_id": [item[2] for item in matched],
-            "metric_code": metric_codes,
-            "metric_value": [Decimal(value) for value in metric_values],
-        }
-        year_values = np.array([item[1].year for item in matched])
-        for year, indices in iter_year_slices(year_values):
-            writer.write(
-                year, {name: [values[i] for i in indices] for name, values in columns.items()}
-            )
-    return writer.close()
+    try:
+        for chunk in reader:
+            mask = chunk["metric_code"].isin(METRIC_SET) & chunk["report_id"].isin(reports.keys())
+            chunk = chunk[mask]
+            if not len(chunk):
+                continue
+            report_ids = chunk["report_id"].tolist()
+            metric_codes = chunk["metric_code"].tolist()
+            metric_values = chunk["metric_value"].tolist()
+            matched = [reports[report_id] for report_id in report_ids]
+            columns = {
+                "report_id": report_ids,
+                "stock_code": [item[0] for item in matched],
+                "report_period": [item[1] for item in matched],
+                "announce_date_id": [item[2] for item in matched],
+                "metric_code": metric_codes,
+                "metric_value": [to_decimal(value, 6) for value in metric_values],
+            }
+            year_values = np.array([item[1].year for item in matched])
+            for year, indices in iter_year_slices(year_values):
+                writer.write(
+                    year, {name: [values[i] for i in indices] for name, values in columns.items()}
+                )
+    finally:
+        counts = writer.close()
+    return counts
 
 
 def export_stocks(data_dir: Path, path: Path) -> int:
@@ -417,10 +453,8 @@ def export_stocks(data_dir: Path, path: Path) -> int:
     merged = stocks.merge(industries, on="tdx_sector_code", how="left")
     merged = merged.sort_values("stock_code")
     columns = {
-        "stock_code": merged["stock_code"].tolist(),
-        "stock_name": merged["stock_name"].tolist(),
-        "tdx_sector_code": merged["tdx_sector_code"].tolist(),
-        "tdx_sector_name": merged["tdx_sector_name"].where(merged["tdx_sector_name"].notna(), None).tolist(),
+        name: [None if is_na(value) else str(value) for value in merged[name]]
+        for name in ("stock_code", "stock_name", "tdx_sector_code", "tdx_sector_name")
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pydict(columns, schema=STOCK_SCHEMA), path, compression="zstd")

@@ -24,3 +24,30 @@
 
 每个快照目录内含 `manifest.json`（schema、行数、逐文件 sha256）与
 `checksums.sha256`，可用于校验数据完整性。
+
+## 估值面板
+
+`derived/valuation/` 由 `scripts/build_valuation_panel.py` 从最新快照构建
+（point-in-time，无未来函数）：
+
+- 比值：`pe`（市值÷归母净利润TTM）、`ps`（市值÷营业总收入TTM）、
+  `pb`（市值÷归母股东权益）、`pcf`（市值÷经营现金流净额TTM）
+- 分位：`pe_pct` 等四列，个股上市以来扩张窗口百分位（0~100，两位小数，
+  满 250 个有效观测后才开始输出）
+- 分母 ≤0 或比值 >10000 记为 NaN；指标值为 0 视为未披露并回退上一期
+- 完整口径见 `derived/valuation/_params.json`
+
+```python
+import pandas as pd
+
+panel = pd.read_parquet("derived/valuation", filters=[("year", ">=", 2020)])
+latest = pd.read_parquet("derived/valuation_latest.parquet")  # 最新截面
+```
+
+## 一键更新
+
+源 CSV 更新后运行（快照未过期则跳过导出，只重建估值面板）：
+
+```bash
+.venv/Scripts/python scripts/update_data.py
+```

@@ -219,4 +219,5 @@ __marimo__/
 
 # raw data
 raw/*
+derived/*
 !raw/.gitkeep
